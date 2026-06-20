@@ -1,0 +1,322 @@
+================================================================================
+EXPLANATION OF RAG_SERVICE.PY - ENTERPRISE RAG DOCUMENT ASSISTANT
+================================================================================
+
+This document provides a comprehensive breakdown of the 'rag_service.py' file.
+It covers:
+1. Overview and Purpose of the File
+2. Imported Modules and Libraries
+3. Global Level Variables
+4. Class Level Attributes / Instance Variables
+5. Class Methods (Purpose, Parameters, Workflow, and Output)
+
+--------------------------------------------------------------------------------
+1. OVERVIEW AND PURPOSE OF THE FILE
+--------------------------------------------------------------------------------
+The file 'rag_service.py' implements the RAGService class, which is the core orchestrator
+of the Retrieval-Augmented Generation (RAG) system. Its responsibilities include:
+  - Ingesting, parsing, and storing local files (PDFs and TXT documents).
+  - Splitting text into smaller semantic chunks to feed into a vector database.
+  - Converting text chunks into vector embeddings and storing them in Chroma DB.
+  - Deleting documents from the local filesystem and clearing related vectors.
+  - Performing similarity search to find context relevant to user queries.
+  - Feeding the retrieved context and question to an LLM (Gemini-2.5-Flash via OpenRouter) to generate accurate answers.
+  - Keeping track of usage statistics (document counts, chunk counts, query counts, latency, database/LLM statuses).
+
+--------------------------------------------------------------------------------
+2. IMPORTED MODULES AND LIBRARIES
+--------------------------------------------------------------------------------
+The following libraries are imported to implement specific features:
+
+* os:
+  - Why: Used for directory creation, checking paths, and manipulating the filesystem.
+  - Use: Resolving file paths for document uploads, saving files on disk, and locating/deleting indexes and documents.
+
+* uuid:
+  - Why: To generate unique, collision-free identifiers for uploaded documents.
+  - Use: Ingesting a document assigns a random uuid.uuid4() string as its unique ID (doc_id) to avoid naming clashes.
+
+* List, Dict, Any (from typing):
+  - Why: Python type hinting.
+  - Use: Providing code editor support and documenting the structure of method signatures (arguments and return types).
+
+* RecursiveCharacterTextSplitter (from langchain_text_splitters):
+  - Why: Standard text splitting mechanism in LangChain.
+  - Use: Divides raw document text into smaller, overlapping chunks (1000 characters chunk size, 200 character overlap) so they fit within the LLM context window and produce specific embeddings.
+
+* PyPDFLoader (from langchain_community.document_loaders):
+  - Why: LangChain document loader for PDF documents.
+  - Use: Parses PDF files page by page, extracting text and returning metadata (e.g., page numbers).
+
+* TextLoader (from langchain_community.document_loaders):
+  - Why: LangChain document loader for standard text documents.
+  - Use: Loads and extracts text content from plain text (.txt) files.
+
+* Chroma (from langchain_chroma):
+  - Why: Local vector store database to store document chunk embeddings.
+  - Use: Houses the vector embeddings of all document chunks and allows similarity search over them using distance metrics.
+
+* OpenAIEmbeddings (from langchain_openai):
+  - Why: Generates vector representations of text chunks.
+  - Use: Connected to OpenRouter to use OpenAI's "openai/text-embedding-3-small" model to encode text chunks.
+
+* ChatOpenAI (from langchain_openai):
+  - Why: LangChain wrapper to interact with chat models.
+  - Use: Instantiates the ChatOpenAI client directed to OpenRouter ("https://openrouter.ai/api/v1") to run the "google/gemini-2.5-flash" model for QA answering.
+
+* ChatPromptTemplate (from langchain_core.prompts):
+  - Why: Structuring prompts sent to the LLM.
+  - Use: Constructs the exact system and user instruction template that takes context inputs and formats them into a schema the model understands.
+
+* load_dotenv (from dotenv):
+  - Why: Loads environment variables from a local '.env' file.
+  - Use: Ensures the RAG service can read variables like API keys (e.g. OPEN_ROUTER_KEY) dynamically without hardcoding.
+
+* time:
+  - Why: Performance metrics collection.
+  - Use: To measure how many milliseconds (latency) the similarity search and LLM invocation take to respond.
+
+* datetime:
+  - Why: Record keeping.
+  - Use: Captures the current date and time when a document is uploaded to show in the metadata list.
+
+--------------------------------------------------------------------------------
+3. GLOBAL LEVEL VARIABLES
+--------------------------------------------------------------------------------
+These variables are defined at the module level (outside the RAGService class):
+
+* UPLOAD_DIR:
+  - Why: Defines the dedicated destination directory where files uploaded by clients are stored.
+  - Use: Set to an absolute path pointing to 'uploaded_files' in the parent directory of this file. If the directory does not exist, it is created at startup.
+
+* CHROMA_DIR:
+  - Why: Defines the storage location of the persistent database for Chroma DB vector index.
+  - Use: Set to an absolute path pointing to 'chroma_db' in the parent directory. Chroma uses this path to save and read binary database files on disk.
+
+--------------------------------------------------------------------------------
+4. CLASS LEVEL ATTRIBUTES / INSTANCE VARIABLES (self.*)
+--------------------------------------------------------------------------------
+Initialized inside RAGService.__init__ to maintain system state:
+
+* self.documents (Dict[str, Dict[str, Any]]):
+  - Why: Serves as an in-memory database of ingested documents.
+  - Use: Stores metadata about each document (id, name, size, status, chunkCount, uploadDate, filePath) mapped by the document's unique UUID string.
+
+* self.query_count (int):
+  - Why: Measures RAG system usage.
+  - Use: Starts at 0 and increments by 1 with each call to query(). Used to compute the average response latency.
+
+* self.total_latency_ms (int):
+  - Why: Tracks total cumulative latency.
+  - Use: Accumulates query times (in milliseconds). Divided by query_count to calculate the average response time.
+
+* self.embeddings (OpenAIEmbeddings or None):
+  - Why: Reference to the active embeddings generator object.
+  - Use: Converts chunk text to vectors for insertion/retrieval in Chroma DB.
+
+* self.vector_store (Chroma or None):
+  - Why: Reference to the active Chroma vector store database client.
+  - Use: Used to call add_documents(), similarity_search(), and delete() operations on the vector space.
+
+* self.initialized (bool):
+  - Why: A flag indicating if the underlying AI models and databases have been initialized successfully.
+  - Use: Controls whether the system executes real RAG logic or falls back to "Preview Mode" (mock response) when no valid API key is present.
+
+* self.api_key (str or None):
+  - Why: Stores the API key loaded from environment variables.
+  - Use: Passed to OpenAIEmbeddings and ChatOpenAI config to authorize connection to OpenRouter.
+
+--------------------------------------------------------------------------------
+5. CLASS METHODS
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+METHOD: __init__(self)
+--------------------------------------------------------------------------------
+* Purpose:
+  Constructor of the RAGService class. It sets default values for properties and calls
+  the private initialization method to prepare connections.
+* Parameters:
+  - None (self object reference only).
+* Workflow:
+  1. Initializes self.documents as an empty dictionary.
+  2. Sets query metrics (query_count, total_latency_ms) to 0.
+  3. Pre-defines self.embeddings and self.vector_store as None.
+  4. Sets self.initialized status to False.
+  5. Pulls "OPEN_ROUTER_KEY" environment variable.
+  6. Invokes self._init_rag() to set up connections.
+* Output:
+  - An initialized instance of the RAGService class.
+
+--------------------------------------------------------------------------------
+METHOD: _init_rag(self)
+--------------------------------------------------------------------------------
+* Purpose:
+  Private helper method that establishes connections to OpenAIEmbeddings and Chroma DB.
+* Parameters:
+  - None.
+* Workflow:
+  1. Checks if self.api_key exists and is not a placeholder value (e.g. "your_openai").
+  2. If valid key is present:
+     - Instantiates OpenAIEmbeddings configured to route through OpenRouter base url
+       (https://openrouter.ai/api/v1) with model "openai/text-embedding-3-small".
+     - Instantiates the Chroma client using the embeddings object and CHROMA_DIR path.
+     - Sets self.initialized to True.
+  3. If API key is missing or invalid:
+     - Prints warning.
+     - Leaves embedding/vector store attributes as None, and sets self.initialized to False (Preview mode).
+* Output:
+  - None (updates class state).
+
+--------------------------------------------------------------------------------
+METHOD: check_connections(self) -> Dict[str, str]
+--------------------------------------------------------------------------------
+* Purpose:
+  Determines the connectivity state of the LangChain LLM and Vector Database.
+* Parameters:
+  - None.
+* Workflow:
+  1. If self.initialized is False, dynamically re-checks environment variables (in case the
+     user added a key to .env after startup) and retries self._init_rag().
+  2. Evaluates self.initialized to verify connections.
+  3. Formulates status reports.
+* Output:
+  - Dict containing connection states:
+    {
+      "llmStatus": "connected" | "disconnected",
+      "vectorDbStatus": "connected" | "disconnected"
+    }
+
+--------------------------------------------------------------------------------
+METHOD: ingest_document(self, file_name: str, file_bytes: bytes) -> Dict[str, Any]
+--------------------------------------------------------------------------------
+* Purpose:
+  Takes raw file data uploaded by a client, saves it locally, partitions the content into
+  manageable text chunks, and uploads those chunks to the vector database.
+* Parameters:
+  - file_name (str): Original name of the uploaded document (e.g., "manual.pdf").
+  - file_bytes (bytes): The raw binary content of the file.
+* Workflow:
+  1. Generates a random UUID (doc_id) for the file.
+  2. Writes file_bytes to disk inside UPLOAD_DIR with the name format '{doc_id}_{file_name}'.
+  3. Creates an initial metadata record in self.documents under status "indexing".
+  4. Routes loader:
+     - Uses PyPDFLoader if file_name ends with '.pdf'.
+     - Uses TextLoader (UTF-8 encoding) for all other file types.
+  5. Loads pages, extracting document structures.
+  6. Applies RecursiveCharacterTextSplitter with chunk_size=1000 and chunk_overlap=200
+     to partition document text into list of chunks.
+  7. Enriches each chunk's metadata with document_id, document_name, and page number.
+  8. Saves chunk count inside document metadata dictionary.
+  9. Vectorizes content:
+     - If initialized, invokes self.vector_store.add_documents(chunks) to index in Chroma DB,
+       then updates status to "ready".
+     - If offline, skips database upload and mocks "ready" status for frontend preview.
+  10. Catches any errors during ingest, logging the issue and setting the status to "error".
+* Output:
+  - The updated document's metadata dictionary.
+
+--------------------------------------------------------------------------------
+METHOD: list_documents(self) -> List[Dict[str, Any]]
+--------------------------------------------------------------------------------
+* Purpose:
+  Retrieves a collection of all documents currently tracked by the RAG system.
+* Parameters:
+  - None.
+* Workflow:
+  1. Extracts all values from the self.documents dictionary.
+  2. Returns them as a python list.
+* Output:
+  - List of document metadata objects.
+
+--------------------------------------------------------------------------------
+METHOD: delete_document(self, doc_id: str) -> bool
+--------------------------------------------------------------------------------
+* Purpose:
+  Removes a document completely from the file system, deletes its chunks from Chroma DB,
+  and cleanses memory state.
+* Parameters:
+  - doc_id (str): The unique UUID representing the document to purge.
+* Workflow:
+  1. Validates presence of doc_id in self.documents. If missing, returns False.
+  2. Locates the physical file path. If it exists, calls os.remove() to delete it.
+  3. If initialized and database exists, deletes chunks:
+     - Invokes self.vector_store.delete(where={"document_id": doc_id}) to clean the index.
+  4. Deletes key-value record from self.documents.
+  5. Returns True.
+* Output:
+  - Boolean: True if successfully deleted, False if document was not found.
+
+--------------------------------------------------------------------------------
+METHOD: get_total_chunks(self) -> int
+--------------------------------------------------------------------------------
+* Purpose:
+  Aggregates the chunkCount values across all ingested documents.
+* Parameters:
+  - None.
+* Workflow:
+  1. Iterates over values in self.documents.
+  2. Sums up 'chunkCount' integers (defaulting to 0 if not present).
+* Output:
+  - Integer representing total count of chunks in the database.
+
+--------------------------------------------------------------------------------
+METHOD: query(self, question: str, temperature: float, max_tokens: int) -> Dict[str, Any]
+--------------------------------------------------------------------------------
+* Purpose:
+  Main entry point for processing a question against uploaded document content using RAG.
+* Parameters:
+  - question (str): The user search text or question.
+  - temperature (float): LLM randomness parameter (0.0 to 1.0).
+  - max_tokens (int): Max token limit for the generated text.
+* Workflow:
+  1. Captures start time using time.time() and increments self.query_count.
+  2. Re-runs initialization check in case user updated API credentials.
+  3. If initialized:
+     - Performs vector similarity search: self.vector_store.similarity_search(question, k=4)
+       to retrieve the top 4 closest text chunks.
+     - Compiles the content of these chunks into a continuous context block string,
+       retaining metadata (sources, page numbers, text snippets).
+  4. Generates Answer:
+     - If initialized and context is found:
+       * Configures ChatOpenAI targeting OpenRouter model "google/gemini-2.5-flash".
+       * Instantiates ChatPromptTemplate instructing the AI to use context to answer,
+         adhering to facts, and outputting "cannot find information" if no context match is found.
+       * Invokes chat with formatted prompt and gets result content.
+     - If not initialized or documents do not exist (Preview/Offline mode):
+       * Fallback: Outputs a mockup preview markdown message explaining how to set up
+         the API key, and provides a simulated source segment.
+  5. Records latency in milliseconds (latency_ms) and updates self.total_latency_ms.
+* Output:
+  - Dict containing the answer payload, sources list, and latency info:
+    {
+      "answer": str,
+      "sources": List[Dict[str, Any]],
+      "latencyMs": int
+    }
+
+--------------------------------------------------------------------------------
+METHOD: get_stats(self) -> Dict[str, Any]
+--------------------------------------------------------------------------------
+* Purpose:
+  Retrieves metrics regarding the RAG service usage, database size, and online health.
+* Parameters:
+  - None.
+* Workflow:
+  1. Queries check_connections() for the status of LLM and Vector Database.
+  2. Calculates the average query response time: self.total_latency_ms / self.query_count
+     (if query_count is greater than 0, otherwise defaults to 0).
+  3. Combines statistics into a nested dictionary structure.
+* Output:
+  - Dict containing the summary stats:
+    {
+      "stats": {
+        "totalDocuments": int,
+        "totalChunks": int,
+        "queryCount": int,
+        "avgResponseTimeMs": int,
+        "vectorDbStatus": "connected" | "disconnected",
+        "llmStatus": "connected" | "disconnected"
+      }
+    }
+================================================================================
