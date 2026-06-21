@@ -94,7 +94,7 @@ function App() {
       }
 
       const result = await response.json();
-      
+
       const assistantMsg: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
@@ -127,7 +127,7 @@ function App() {
 
       {/* Main app panel */}
       <div className="main-content">
-        
+
         {/* Header */}
         <header style={{
           height: 'var(--header-height)',

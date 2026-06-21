@@ -55,6 +55,8 @@ async def upload_document(file: UploadFile = File(...)):
       "message": "File uploaded and indexed successfully",
       "document": document_info
     }
+  except ValueError as ve:
+    raise HTTPException(status_code=400, detail=str(ve))
   except Exception as e:
     raise HTTPException(status_code=500, detail=f"Inward server error during upload: {str(e)}")
 

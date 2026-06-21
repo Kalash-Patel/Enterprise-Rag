@@ -57,6 +57,11 @@ class RAGService:
 
         self.initialized = True
         print("RAGService initialized with OpenAI Embeddings and Chroma DB.")
+        # Load existing documents from vector store to sync in-memory state
+        try:
+          self.list_documents()
+        except Exception as e:
+          print(f"Error syncing documents at init: {e}")
       else:
         print("OPENAI_API_KEY not set or invalid. Running in Mock/Preview mode.")
         self.embeddings = None
@@ -78,6 +83,12 @@ class RAGService:
     }
 
   def ingest_document(self, file_name: str, file_bytes: bytes) -> Dict[str, Any]:
+    # Check if document already exists
+    self.list_documents()
+    for doc in self.documents.values():
+      if doc["name"].lower() == file_name.lower():
+        raise ValueError(f"Document with filename '{file_name}' already exists.")
+
     doc_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{file_name}")
     
@@ -122,6 +133,11 @@ class RAGService:
         chunk.metadata["document_name"] = file_name
         if "page" not in chunk.metadata:
           chunk.metadata["page"] = 1
+        chunk.metadata["uploadDate"] = datetime.datetime.now().isoformat()
+        chunk.metadata["status"] = "ready"
+        chunk.metadata["size"] = doc_size
+        chunk.metadata["filePath"] = file_path
+
 
       doc_info["chunkCount"] = len(chunks)
 
@@ -144,9 +160,71 @@ class RAGService:
       return doc_info
 
   def list_documents(self) -> List[Dict[str, Any]]:
+    # Dynamic reload in case user updates .env
+    if not self.initialized:
+      self.api_key = os.getenv("OPEN_ROUTER_KEY")
+      self._init_rag()
+
+    if self.initialized and self.vector_store:
+      try:
+        result = self.vector_store.get()
+        metadatas = result.get("metadatas", [])
+        
+        # Group chunks by document_id to reconstruct documents dictionary
+        grouped_docs = {}
+        for meta in metadatas:
+          if not meta:
+            continue
+          doc_id = meta.get("document_id")
+          if not doc_id:
+            continue
+          
+          if doc_id not in grouped_docs:
+            grouped_docs[doc_id] = []
+          grouped_docs[doc_id].append(meta)
+
+        # Merge reconstructed documents into self.documents
+        for doc_id, chunks_meta in grouped_docs.items():
+          # If document is currently indexing in memory, don't overwrite it
+          if doc_id in self.documents and self.documents[doc_id].get("status") == "indexing":
+            continue
+          
+          first_chunk = chunks_meta[0]
+          name = first_chunk.get("document_name") or first_chunk.get("name") or "Unknown Document"
+          file_path = first_chunk.get("filePath") or first_chunk.get("source") or ""
+          upload_date = first_chunk.get("uploadDate") or ""
+          status = first_chunk.get("status") or "ready"
+          
+          # Determine size
+          size = first_chunk.get("size")
+          if size is None:
+            if file_path and os.path.exists(file_path):
+              try:
+                size = os.path.getsize(file_path)
+              except Exception:
+                size = 0
+            else:
+              size = 0
+              
+          self.documents[doc_id] = {
+            "id": doc_id,
+            "name": name,
+            "size": size,
+            "status": status,
+            "chunkCount": len(chunks_meta),
+            "uploadDate": upload_date,
+            "filePath": file_path
+          }
+      except Exception as e:
+        print(f"Error reading from Chroma DB: {e}")
+
     return list(self.documents.values())
 
   def delete_document(self, doc_id: str) -> bool:
+
+    #To delete all the data from vectordb
+    # result = self.vector_store.get()
+    # self.vector_store.delete(ids=result["ids"]) 
     if doc_id not in self.documents:
       return False
       
